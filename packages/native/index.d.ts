@@ -3,6 +3,8 @@
 /** The main GPUI renderer exposed to Node.js. */
 export declare class GpuixRenderer {
   constructor(eventCallback?: (((err: Error | null, arg: EventPayload) => any)) | undefined | null)
+  /** Stable ID used to parent another renderer's native popup window. */
+  getWindowId(): number
   /** Initialize GPUI using the native event-loop architecture for this OS. */
   init(options?: WindowOptions | undefined | null): void
   createElement(id: number, elementType: string): void
@@ -78,6 +80,8 @@ export declare class GpuixRenderer {
    * with `show: false` or `focus: false` is revealed later.
    */
   activateWindow(): void
+  /** Close only this renderer's window. Other renderer windows keep running. */
+  closeWindow(): void
   setWindowTitle(title: string): void
   focusElement(elementId: number): void
   blur(): void
@@ -371,6 +375,27 @@ export declare class TestGpuixRenderer {
   getWindowSize(): WindowSize
 }
 
+export interface AnchoredPopupOptions {
+  /** `getWindowId()` from the renderer that owns the parent window. */
+  parentWindowId: number
+  anchorX: number
+  anchorY: number
+  anchorWidth: number
+  anchorHeight: number
+  /**
+   * `center`, `top`, `bottom`, `left`, `right`, `topLeft`, `bottomLeft`,
+   * `topRight`, or `bottomRight`.
+   */
+  anchor?: string
+  /** Uses the same values as `anchor`. */
+  gravity?: string
+  offsetX?: number
+  offsetY?: number
+  /** Any of `flipX`, `flipY`, `slideX`, `slideY`, `resizeX`, `resizeY`. */
+  constraintAdjustment?: Array<string>
+  grab?: boolean
+}
+
 /** Recorded draw times from the debug frame overlay. */
 export interface DebugFrameOverlayStats {
   currentMs?: number
@@ -564,6 +589,11 @@ export interface WindowOptions {
    * `activateWindow()` to reveal it. Ignored on Linux.
    */
   show?: boolean
+  /**
+   * Open this renderer as a native popup owned by another renderer window.
+   * Currently supported on Windows.
+   */
+  anchoredPopup?: AnchoredPopupOptions
 }
 
 export interface WindowSize {

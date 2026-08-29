@@ -613,8 +613,12 @@ export interface NativeRenderer {
   getWindowSize?(): { width: number; height: number }
   getWindowInsets?(): NativeWindowInsets
   setWindowTitle?(title: string): void
+  /** Stable ID used as `anchoredPopup.parentWindowId` by another renderer. */
+  getWindowId?(): number
   /** Bring the window forward and focus it. Reveals a `show: false` window. */
   activateWindow?(): void
+  /** Close this renderer's window without stopping sibling renderer windows. */
+  closeWindow?(): void
   setDebugFrameOverlay?(mode: DebugFrameOverlayMode): string
   getDebugFrameOverlay?(): string
   cycleDebugFrameOverlay?(): string

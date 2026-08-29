@@ -415,6 +415,7 @@ terminal.
 | `appName` | string | Name inside the macOS `Hide X` and `Quit X` items. Defaults to `title` |
 | `focus` | boolean, default `true` | `false` opens the window behind the active app, like `open -g` |
 | `show` | boolean, default `true` | `false` opens the window hidden. Call `activateWindow()` to reveal it |
+| `anchoredPopup` | object | Open a Windows renderer as a transparent native popup owned and positioned by another renderer |
 
 Call it again after a save and it remounts the tree on the same window.
 
@@ -456,6 +457,46 @@ have one.
 id, and one event map, so `createRoot()` throws if that renderer already has a
 mounted root. Call `unmount()` on the first root before you create another;
 `render()` already does that for you.
+
+### Native anchored popups on Windows
+
+Windows renderers share one GPUI application host, so a second renderer can be
+an owned popup instead of a second unrelated application window. The popup is
+composited with per-pixel alpha: draw the rounded surface in React and leave the
+window background transparent. Do not apply a Win32 region mask; region edges
+are binary and visibly stair-step on rounded corners.
+
+```tsx
+const parent = createRenderer()
+parent.init({ title: 'Library', width: 560, height: 420 })
+
+const popup = createRenderer()
+popup.init({
+  width: 320,
+  height: 240,
+  focus: false,
+  resizable: false,
+  windowBackground: 'transparent',
+  anchoredPopup: {
+    parentWindowId: parent.getWindowId(),
+    anchorX: 24,
+    anchorY: 120,
+    anchorWidth: 280,
+    anchorHeight: 40,
+    anchor: 'bottomLeft',
+    gravity: 'bottomRight',
+    offsetY: 6,
+    constraintAdjustment: ['flipY', 'slideX', 'slideY'],
+    grab: false,
+  },
+})
+```
+
+The anchor rectangle is measured in the parent window's logical pixels. The
+native backend converts it to the parent monitor's scale, keeps the popup on
+screen, assigns the owner window, and waits for the transparent background
+before showing the first frame. Call `popup.closeWindow()` when the popover is
+dismissed; closing it does not stop the parent renderer.
 
 ### Background launch
 
@@ -2571,7 +2612,7 @@ The test renderer uses `VisualTestAppContext` with a `TestDispatcher` for determ
 - [x] Last window close quits the process
 - [x] Debug frame overlay (`debugFrameOverlay` / `setDebugFrameOverlay`)
 - [ ] Canvas element
-- [ ] Multiple windows
+- [x] Multiple Windows windows, including owned anchored popups
 - [x] JS remount under `bun --hot` (`render()` keeps the native window)
 - [ ] React Refresh during `bun --hot` (needs a Bun runtime transform)
 - [ ] Hot reload of the native `.node` addon. `bun run dev` rebuilds and restarts. Native modules cannot unload.

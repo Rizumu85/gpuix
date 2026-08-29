@@ -29,6 +29,11 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
+#[cfg(target_os = "windows")]
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    OnceLock,
+};
 use std::sync::{Arc, Mutex};
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
 use std::time::Duration;
@@ -134,9 +139,9 @@ thread_local! {
     /// ScrollHandle is Rc<RefCell<...>> so its methods (set_offset, offset,
     /// scroll_to_item) work without an App context.
     ///
-    /// NOTE: This is a singleton — if multiple renderers/windows coexist,
-    /// the last one to render wins. Acceptable for now (single-window only).
-    /// TODO: Scope by renderer/window ID when multi-window support is added.
+    /// Threaded desktop windows read their handles directly from `GpuixView`.
+    /// These mirrors remain for embedded and test renderers that do not route
+    /// commands through a specific window entity.
     static SCROLL_HANDLES: RefCell<HashMap<u64, gpui::ScrollHandle>> = RefCell::new(HashMap::new());
     static VIRTUAL_LIST_STATES: RefCell<HashMap<u64, gpui::ListState>> = RefCell::new(HashMap::new());
     /// Virtual-list scrolls queued for the next `GpuixView::render`, applied
@@ -149,6 +154,13 @@ thread_local! {
     static PENDING_VIRTUAL_LIST_SCROLLS: RefCell<HashMap<u64, gpui::ListOffset>> =
         RefCell::new(HashMap::new());
 }
+
+#[cfg(target_os = "windows")]
+static NEXT_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(target_os = "windows")]
+static WINDOWS_UI_HOST: OnceLock<Mutex<Option<mpsc::UnboundedSender<WindowsHostCommand>>>> =
+    OnceLock::new();
 
 /// Queue a virtual-list scroll for the next render. `offset_in_item` may be
 /// negative: gpui then anchors the viewport top above the item, which is what
@@ -382,6 +394,20 @@ enum UiCommand {
         response: SyncSender<std::result::Result<(), String>>,
     },
     Blur,
+    CloseWindow,
+}
+
+#[cfg(target_os = "windows")]
+enum WindowsHostCommand {
+    OpenWindow {
+        window_id: u64,
+        options: WindowOptions,
+        tree: Arc<Mutex<RetainedTree>>,
+        event_callback: Option<EventCallback>,
+        selection: SharedSelection,
+        ui_commands: mpsc::UnboundedReceiver<UiCommand>,
+        response: SyncSender<std::result::Result<(), String>>,
+    },
 }
 
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
@@ -403,6 +429,7 @@ async fn run_ui_commands(
 ) {
     while let Some(command) = commands.next().await {
         let result = match command {
+            UiCommand::CloseWindow => break,
             UiCommand::Invalidate => refresh_ui_window(window, cx),
             UiCommand::ActivateWindow => window.update(cx, |_view, window, cx| {
                 cx.activate(true);
@@ -449,87 +476,76 @@ async fn run_ui_commands(
             UiCommand::ResetDebugFrameOverlayStats => window.update(cx, |_view, window, _cx| {
                 window.reset_debug_frame_overlay_stats();
             }),
-            UiCommand::ScrollTo { id, x, y } => {
-                if !VIRTUAL_LIST_STATES.with(|cell| {
-                    let states = cell.borrow();
-                    let Some(state) = states.get(&id) else {
-                        return false;
-                    };
-                    state.set_offset_from_scrollbar(gpui::point(gpui::px(x), gpui::px(y)));
-                    true
-                }) {
-                    SCROLL_HANDLES.with(|cell| {
-                        if let Some(handle) = cell.borrow().get(&id) {
-                            handle.set_offset(gpui::point(gpui::px(x), gpui::px(y)));
-                        }
-                    });
+            UiCommand::ScrollTo { id, x, y } => window.update(cx, move |view, window, cx| {
+                if let Some(entry) = view.virtual_lists.get(&id) {
+                    entry
+                        .state
+                        .set_offset_from_scrollbar(gpui::point(gpui::px(x), gpui::px(y)));
+                } else if let Some(handle) = view.scroll_handles.get(&id) {
+                    handle.set_offset(gpui::point(gpui::px(x), gpui::px(y)));
                 }
-                refresh_ui_window(window, cx)
-            }
+                cx.notify();
+                window.refresh();
+            }),
             UiCommand::ScrollToItem { id, index, offset } => {
-                if !VIRTUAL_LIST_STATES.with(|cell| {
-                    if !cell.borrow().contains_key(&id) {
-                        return false;
+                window.update(cx, move |view, window, cx| {
+                    if view.virtual_lists.contains_key(&id) {
+                        queue_virtual_list_scroll(id, index, offset);
+                    } else if let Some(handle) = view.scroll_handles.get(&id) {
+                        handle.scroll_to_item(index);
                     }
-                    queue_virtual_list_scroll(id, index, offset);
-                    true
-                }) {
-                    SCROLL_HANDLES.with(|cell| {
-                        if let Some(handle) = cell.borrow().get(&id) {
-                            handle.scroll_to_item(index);
-                        }
-                    });
-                }
-                refresh_ui_window(window, cx)
+                    cx.notify();
+                    window.refresh();
+                })
             }
             UiCommand::GetScrollOffset { id, response } => {
-                let offset = VIRTUAL_LIST_STATES
-                    .with(|cell| {
-                        cell.borrow().get(&id).map(|state| {
-                            let offset = state.scroll_px_offset_for_scrollbar();
+                window.update(cx, move |view, _window, _cx| {
+                    let offset = view
+                        .virtual_lists
+                        .get(&id)
+                        .map(|entry| {
+                            let offset = entry.state.scroll_px_offset_for_scrollbar();
                             [
                                 f64::from(f32::from(offset.x)),
                                 f64::from(f32::from(offset.y)),
                             ]
                         })
-                    })
-                    .or_else(|| {
-                        SCROLL_HANDLES.with(|cell| {
-                            cell.borrow().get(&id).map(|handle| {
+                        .or_else(|| {
+                            view.scroll_handles.get(&id).map(|handle| {
                                 let offset = handle.offset();
                                 [
                                     f64::from(f32::from(offset.x)),
                                     f64::from(f32::from(offset.y)),
                                 ]
                             })
-                        })
-                    });
-                response.send(offset).ok();
-                Ok(())
+                        });
+                    response.send(offset).ok();
+                })
             }
             UiCommand::GetListScrollTop { id, response } => {
-                let top = VIRTUAL_LIST_STATES.with(|cell| {
-                    cell.borrow().get(&id).map(|state| {
-                        let top = state.logical_scroll_top();
+                window.update(cx, move |view, _window, _cx| {
+                    let top = view.virtual_lists.get(&id).map(|entry| {
+                        let top = entry.state.logical_scroll_top();
                         [
                             top.item_ix as f64,
                             f64::from(f32::from(top.offset_in_item)),
-                            f64::from(f32::from(state.viewport_bounds().size.height)),
+                            f64::from(f32::from(entry.state.viewport_bounds().size.height)),
                         ]
-                    })
-                });
-                response.send(top).ok();
-                Ok(())
+                    });
+                    response.send(top).ok();
+                })
             }
-            UiCommand::GetWindowSize { response } => window.update(cx, move |_view, window, _cx| {
-                let size = window.viewport_size();
-                response
-                    .send(WindowSize {
-                        width: f32::from(size.width) as f64,
-                        height: f32::from(size.height) as f64,
-                    })
-                    .ok();
-            }),
+            UiCommand::GetWindowSize { response } => {
+                window.update(cx, move |_view, window, _cx| {
+                    let size = window.viewport_size();
+                    response
+                        .send(WindowSize {
+                            width: f32::from(size.width) as f64,
+                            height: f32::from(size.height) as f64,
+                        })
+                        .ok();
+                })
+            }
             UiCommand::GetAutomationBounds { response } => {
                 window.update(cx, move |_view, window, cx| {
                     cx.notify();
@@ -684,6 +700,12 @@ async fn run_ui_commands(
             log::error!("Failed to handle GPUI UI command: {error:#}");
         }
     }
+    #[cfg(target_os = "windows")]
+    if let Err(error) = window.update(cx, |_view, window, _cx| window.remove_window()) {
+        log::error!("Failed to close the GPUI window: {error:#}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     cx.update(|cx| cx.quit());
 }
 
@@ -696,10 +718,117 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "unknown panic".to_string())
 }
 
+#[cfg(target_os = "windows")]
+fn windows_ui_host_sender() -> Result<mpsc::UnboundedSender<WindowsHostCommand>> {
+    let host = WINDOWS_UI_HOST.get_or_init(|| Mutex::new(None));
+    let mut stored = host.lock().unwrap();
+    if let Some(sender) = stored.as_ref().filter(|sender| !sender.is_closed()) {
+        return Ok(sender.clone());
+    }
+
+    let (sender, commands) = mpsc::unbounded();
+    std::thread::Builder::new()
+        .name("gpuix-ui".to_string())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                gpui_platform::application().run(move |cx| {
+                    init_key_bindings(cx);
+                    crate::custom_elements::input::init(cx);
+                    cx.spawn(async move |cx| {
+                        run_windows_host(commands, cx).await;
+                    })
+                    .detach();
+                });
+            }));
+
+            if let Err(payload) = result {
+                log::error!("The GPUI UI thread panicked: {}", panic_message(payload));
+            }
+            if let Some(host) = WINDOWS_UI_HOST.get() {
+                host.lock().unwrap().take();
+            }
+        })
+        .map_err(|error| {
+            Error::from_reason(format!("Failed to spawn the GPUI UI thread: {error}"))
+        })?;
+
+    *stored = Some(sender.clone());
+    Ok(sender)
+}
+
+#[cfg(target_os = "windows")]
+async fn run_windows_host(
+    mut commands: mpsc::UnboundedReceiver<WindowsHostCommand>,
+    cx: &mut gpui::AsyncApp,
+) {
+    let mut windows = HashMap::<u64, gpui::WindowHandle<GpuixView>>::new();
+
+    while let Some(command) = commands.next().await {
+        match command {
+            WindowsHostCommand::OpenWindow {
+                window_id,
+                options,
+                tree,
+                event_callback,
+                selection,
+                ui_commands,
+                response,
+            } => {
+                let title = options.title.clone().unwrap_or_else(|| "GPUIX".to_string());
+                let activate = options.focus.unwrap_or(true);
+                let parent = options
+                    .anchored_popup
+                    .as_ref()
+                    .and_then(|popup| raw_element_id(popup.parent_window_id).ok())
+                    .and_then(|parent_id| windows.get(&parent_id).copied())
+                    .map(gpui::AnyWindowHandle::from);
+
+                let opened = cx.update(|cx| {
+                    let bounds = gpui::Bounds::centered(
+                        None,
+                        gpui::size(
+                            gpui::px(options.width.unwrap_or(800.0) as f32),
+                            gpui::px(options.height.unwrap_or(600.0) as f32),
+                        ),
+                        cx,
+                    );
+                    let mut window_options = to_gpui_window_options(&options, bounds);
+                    configure_anchored_popup(&options, parent, &mut window_options)
+                        .map_err(anyhow::Error::msg)?;
+                    cx.open_window(window_options, |_window, cx| {
+                        cx.new(|_| GpuixView::new(tree, event_callback, title, selection))
+                    })
+                });
+
+                match opened {
+                    Ok(window) => {
+                        windows.insert(window_id, window);
+                        cx.spawn(async move |cx| {
+                            run_ui_commands(ui_commands, window, cx).await;
+                        })
+                        .detach();
+                        if activate {
+                            cx.update(|cx| cx.activate(true));
+                        }
+                        response.send(Ok(())).ok();
+                    }
+                    Err(error) => {
+                        response
+                            .send(Err(format!("Failed to open the GPUI window: {error:#}")))
+                            .ok();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The main GPUI renderer exposed to Node.js.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 #[napi]
 pub struct GpuixRenderer {
+    #[cfg(target_os = "windows")]
+    window_id: u64,
     event_callback: Mutex<Option<Arc<ThreadsafeFunction<EventPayload>>>>,
     tree: Arc<Mutex<RetainedTree>>,
     initialized: Arc<Mutex<bool>>,
@@ -824,6 +953,8 @@ impl GpuixRenderer {
     pub fn new(event_callback: Option<ThreadsafeFunction<EventPayload>>) -> Self {
         let _ = env_logger::try_init();
         Self {
+            #[cfg(target_os = "windows")]
+            window_id: NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed),
             event_callback: Mutex::new(event_callback.map(Arc::new)),
             tree: Arc::new(Mutex::new(RetainedTree::new())),
             initialized: Arc::new(Mutex::new(false)),
@@ -831,6 +962,16 @@ impl GpuixRenderer {
             #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
             ui_commands: Mutex::new(None),
         }
+    }
+
+    /// Stable ID used to parent another renderer's native popup window.
+    #[napi]
+    pub fn get_window_id(&self) -> f64 {
+        #[cfg(target_os = "windows")]
+        return self.window_id as f64;
+
+        #[cfg(not(target_os = "windows"))]
+        0.0
     }
 
     /// Initialize GPUI using the native event-loop architecture for this OS.
@@ -852,8 +993,40 @@ impl GpuixRenderer {
         #[cfg(target_os = "macos")]
         return self.init_macos(options);
 
-        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+        #[cfg(target_os = "windows")]
+        return self.init_windows(options);
+
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         return self.init_threaded(options);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn init_windows(&self, options: Option<WindowOptions>) -> Result<()> {
+        let options = options.unwrap_or_default();
+        if *self.initialized.lock().unwrap() {
+            return Err(Error::from_reason("Renderer is already initialized"));
+        }
+
+        let (command_sender, command_receiver) = mpsc::unbounded();
+        let (startup_sender, startup_receiver) = sync_channel(1);
+        windows_ui_host_sender()?
+            .unbounded_send(WindowsHostCommand::OpenWindow {
+                window_id: self.window_id,
+                options,
+                tree: self.tree.clone(),
+                event_callback: self.event_callback_for_view(),
+                selection: self.selection.clone(),
+                ui_commands: command_receiver,
+                response: startup_sender,
+            })
+            .map_err(|_| Error::from_reason("The GPUI UI thread is not running"))?;
+
+        recv_ui_response(startup_receiver, "the GPUI window initialization")?
+            .map_err(Error::from_reason)?;
+        *self.ui_commands.lock().unwrap() = Some(command_sender);
+        *self.initialized.lock().unwrap() = true;
+        self.event_callback.lock().unwrap().take();
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
@@ -964,7 +1137,7 @@ impl GpuixRenderer {
         Ok(())
     }
 
-    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn init_threaded(&self, options: Option<WindowOptions>) -> Result<()> {
         let options = options.unwrap_or_default();
         if *self.initialized.lock().unwrap() {
@@ -1422,6 +1595,26 @@ impl GpuixRenderer {
 
         #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
         return self.send_ui_command(UiCommand::ActivateWindow);
+
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "linux",
+            target_os = "freebsd"
+        )))]
+        Err(Error::from_reason(
+            "The production GPUIX renderer does not support this operating system",
+        ))
+    }
+
+    /// Close only this renderer's window. Other renderer windows keep running.
+    #[napi]
+    pub fn close_window(&self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        return update_window(|_view, window, _cx| window.remove_window());
+
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+        return self.send_ui_command(UiCommand::CloseWindow);
 
         #[cfg(not(any(
             target_os = "macos",
@@ -5354,6 +5547,27 @@ pub struct DebugFrameOverlayStats {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), napi(object))]
+pub struct AnchoredPopupOptions {
+    /// `getWindowId()` from the renderer that owns the parent window.
+    pub parent_window_id: f64,
+    pub anchor_x: f64,
+    pub anchor_y: f64,
+    pub anchor_width: f64,
+    pub anchor_height: f64,
+    /// `center`, `top`, `bottom`, `left`, `right`, `topLeft`, `bottomLeft`,
+    /// `topRight`, or `bottomRight`.
+    pub anchor: Option<String>,
+    /// Uses the same values as `anchor`.
+    pub gravity: Option<String>,
+    pub offset_x: Option<f64>,
+    pub offset_y: Option<f64>,
+    /// Any of `flipX`, `flipY`, `slideX`, `slideY`, `resizeX`, `resizeY`.
+    pub constraint_adjustment: Option<Vec<String>>,
+    pub grab: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), napi(object))]
 pub struct WindowOptions {
     pub title: Option<String>,
     /// The name used inside the macOS "Hide" and "Quit" menu items. Defaults to
@@ -5381,6 +5595,9 @@ pub struct WindowOptions {
     /// Show the window when it opens. `false` opens it hidden; call
     /// `activateWindow()` to reveal it. Ignored on Linux.
     pub show: Option<bool>,
+    /// Open this renderer as a native popup owned by another renderer window.
+    /// Currently supported on Windows.
+    pub anchored_popup: Option<AnchoredPopupOptions>,
 }
 
 impl Default for WindowOptions {
@@ -5401,7 +5618,99 @@ impl Default for WindowOptions {
             traffic_light_y: None,
             focus: Some(true),
             show: Some(true),
+            anchored_popup: None,
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn configure_anchored_popup(
+    options: &WindowOptions,
+    parent: Option<gpui::AnyWindowHandle>,
+    window_options: &mut gpui::WindowOptions,
+) -> std::result::Result<(), String> {
+    let Some(popup) = options.anchored_popup.as_ref() else {
+        return Ok(());
+    };
+    let parent = parent.ok_or_else(|| {
+        format!(
+            "Anchored popup parent window {} is not open",
+            popup.parent_window_id
+        )
+    })?;
+    let mut constraint_adjustment = gpui::popup::PopupConstraintAdjustment::empty();
+    let adjustments: Vec<&str> = popup
+        .constraint_adjustment
+        .as_ref()
+        .map(|values| values.iter().map(String::as_str).collect())
+        .unwrap_or_else(|| vec!["flipX", "flipY", "slideX", "slideY"]);
+    for adjustment in adjustments {
+        constraint_adjustment |= match adjustment {
+            "flipX" => gpui::popup::PopupConstraintAdjustment::FLIP_X,
+            "flipY" => gpui::popup::PopupConstraintAdjustment::FLIP_Y,
+            "slideX" => gpui::popup::PopupConstraintAdjustment::SLIDE_X,
+            "slideY" => gpui::popup::PopupConstraintAdjustment::SLIDE_Y,
+            "resizeX" => gpui::popup::PopupConstraintAdjustment::RESIZE_X,
+            "resizeY" => gpui::popup::PopupConstraintAdjustment::RESIZE_Y,
+            value => return Err(format!("Unknown popup constraint adjustment {value:?}")),
+        };
+    }
+    window_options.kind = gpui::WindowKind::AnchoredPopup(gpui::popup::PopupOptions {
+        parent,
+        anchor_rect: gpui::Bounds {
+            origin: gpui::point(
+                gpui::px(popup.anchor_x as f32),
+                gpui::px(popup.anchor_y as f32),
+            ),
+            size: gpui::size(
+                gpui::px(popup.anchor_width as f32),
+                gpui::px(popup.anchor_height as f32),
+            ),
+        },
+        anchor: parse_popup_anchor(popup.anchor.as_deref().unwrap_or("bottomLeft"))?,
+        gravity: parse_popup_gravity(popup.gravity.as_deref().unwrap_or("bottomRight"))?,
+        constraint_adjustment,
+        offset: gpui::point(
+            gpui::px(popup.offset_x.unwrap_or(0.0) as f32),
+            gpui::px(popup.offset_y.unwrap_or(0.0) as f32),
+        ),
+        grab: popup.grab.unwrap_or(false),
+    });
+    window_options.titlebar = None;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn parse_popup_anchor(value: &str) -> std::result::Result<gpui::popup::PopupAnchor, String> {
+    use gpui::popup::PopupAnchor;
+    match value {
+        "center" => Ok(PopupAnchor::Center),
+        "top" => Ok(PopupAnchor::Top),
+        "bottom" => Ok(PopupAnchor::Bottom),
+        "left" => Ok(PopupAnchor::Left),
+        "right" => Ok(PopupAnchor::Right),
+        "topLeft" => Ok(PopupAnchor::TopLeft),
+        "bottomLeft" => Ok(PopupAnchor::BottomLeft),
+        "topRight" => Ok(PopupAnchor::TopRight),
+        "bottomRight" => Ok(PopupAnchor::BottomRight),
+        _ => Err(format!("Unknown popup anchor {value:?}")),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn parse_popup_gravity(value: &str) -> std::result::Result<gpui::popup::PopupGravity, String> {
+    use gpui::popup::PopupGravity;
+    match value {
+        "center" => Ok(PopupGravity::Center),
+        "top" => Ok(PopupGravity::Top),
+        "bottom" => Ok(PopupGravity::Bottom),
+        "left" => Ok(PopupGravity::Left),
+        "right" => Ok(PopupGravity::Right),
+        "topLeft" => Ok(PopupGravity::TopLeft),
+        "bottomLeft" => Ok(PopupGravity::BottomLeft),
+        "topRight" => Ok(PopupGravity::TopRight),
+        "bottomRight" => Ok(PopupGravity::BottomRight),
+        _ => Err(format!("Unknown popup gravity {value:?}")),
     }
 }
 
