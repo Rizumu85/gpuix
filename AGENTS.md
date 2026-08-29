@@ -1193,6 +1193,7 @@ belong in README. This list is only the remaining engineering work.
 - [x] Last window close quits the process
 - [x] Runtime errors keep the macOS window alive and show a stack overlay
 - [x] Debug frame overlay (`setDebugFrameOverlay`)
+- [x] Multiple Windows windows and native anchored popups
 
 ### TODO
 
@@ -1208,7 +1209,6 @@ belong in README. This list is only the remaining engineering work.
 #### Low Priority
 
 - [ ] **Window controls** - resize, minimize (title already works)
-- [ ] **Multiple windows** - Support multiple GPUI windows
 - [x] **JS remount** - `render()` plus `bun --hot` remounts the React tree on the same window
 - [x] **React Refresh in the browser** - `bun run web` keeps `useState` across saves
 - [ ] **React Refresh on desktop** - `bun --hot` is the runtime, not the bundler, so it runs no Fast Refresh transform. Tracked as [oven-sh/bun#40179](https://github.com/oven-sh/bun/issues/40179)
