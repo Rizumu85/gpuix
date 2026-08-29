@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
 #[cfg(target_os = "windows")]
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::AtomicU64,
     OnceLock,
 };
 use std::sync::{Arc, Mutex};
@@ -184,6 +184,16 @@ static NEXT_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
 #[cfg(target_os = "windows")]
 static WINDOWS_UI_HOST: OnceLock<Mutex<Option<mpsc::UnboundedSender<WindowsHostCommand>>>> =
     OnceLock::new();
+
+/// Whether the shared Windows UI thread is still inside `Platform::run`.
+///
+/// `tick()` reports this so the JS frame loop can exit the process after the
+/// last window closes. On Windows every renderer shares one UI thread — that is
+/// what makes a popup renderer possible at all — so the host owns the flag and
+/// every renderer on this platform reads it, instead of the per-renderer
+/// `ui_running` the threaded Linux path uses.
+#[cfg(target_os = "windows")]
+static WINDOWS_UI_RUNNING: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 /// Queue a virtual-list scroll for the next render. `offset_in_item` may be
 /// negative: gpui then anchors the viewport top above the item, which is what
@@ -604,17 +614,6 @@ async fn run_ui_commands(
                         .ok();
                 })
             }
-            UiCommand::GetWindowSize { response } => {
-                window.update(cx, move |_view, window, _cx| {
-                    let size = window.viewport_size();
-                    response
-                        .send(WindowSize {
-                            width: f32::from(size.width) as f64,
-                            height: f32::from(size.height) as f64,
-                        })
-                        .ok();
-                })
-            }
             UiCommand::GetAutomationBounds { response } => {
                 window.update(cx, move |_view, window, cx| {
                     cx.notify();
@@ -838,19 +837,32 @@ fn windows_ui_host_sender() -> Result<mpsc::UnboundedSender<WindowsHostCommand>>
     }
 
     let (sender, commands) = mpsc::unbounded();
+    let ui_running = WINDOWS_UI_RUNNING
+        .get_or_init(|| Arc::new(AtomicBool::new(false)))
+        .clone();
     std::thread::Builder::new()
         .name("gpuix-ui".to_string())
         .spawn(move || {
+            // Same two steps the threaded path takes: PerMonitorV2 before the
+            // platform exists, and a flag the JS frame loop can observe.
+            GpuixRenderer::enable_per_monitor_dpi();
+            ui_running.store(true, Ordering::Release);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                gpui_platform::application().run(move |cx| {
-                    init_key_bindings(cx);
-                    crate::custom_elements::input::init(cx);
-                    cx.spawn(async move |cx| {
-                        run_windows_host(commands, cx).await;
-                    })
-                    .detach();
-                });
+                // Default is already LastWindowClosed on Windows. Set it anyway
+                // so a GPUI default change cannot leave bun running after the
+                // last window closes.
+                gpui_platform::application()
+                    .with_quit_mode(gpui::QuitMode::LastWindowClosed)
+                    .run(move |cx| {
+                        crate::custom_elements::input::init(cx);
+                        crate::custom_elements::img::init(cx);
+                        cx.spawn(async move |cx| {
+                            run_windows_host(commands, cx).await;
+                        })
+                        .detach();
+                    });
             }));
+            ui_running.store(false, Ordering::Release);
 
             if let Err(payload) = result {
                 log::error!("The GPUI UI thread panicked: {}", panic_message(payload));
@@ -1443,7 +1455,20 @@ impl GpuixRenderer {
             return Ok(running);
         }
 
-        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+        #[cfg(target_os = "windows")]
+        {
+            // One shared UI thread, one shared flag: see `WINDOWS_UI_RUNNING`.
+            let running = WINDOWS_UI_RUNNING
+                .get()
+                .map(|flag| flag.load(Ordering::Acquire))
+                .unwrap_or(false);
+            if !running {
+                self.ui_commands.lock().unwrap().take();
+            }
+            return Ok(running);
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         {
             let running = self.ui_running.load(Ordering::Acquire);
             if !running {
@@ -6261,8 +6286,6 @@ fn parse_popup_gravity(value: &str) -> std::result::Result<gpui::popup::PopupGra
         "topRight" => Ok(PopupGravity::TopRight),
         "bottomRight" => Ok(PopupGravity::BottomRight),
         _ => Err(format!("Unknown popup gravity {value:?}")),
-    }
-}
     }
 }
 
