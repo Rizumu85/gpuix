@@ -71,7 +71,6 @@ const TEXTAREA_KEY_CONTEXT: &str = "GpuixTextarea";
 const TEXTAREA_SUBMIT_KEY_CONTEXT: &str = "GpuixTextareaSubmit";
 const CARET_BLINK_MS: u64 = 500;
 const CARET_WIDTH: Pixels = px(2.0);
-const CARET_HEIGHT_RATIO: f32 = 0.75;
 const DRAG_SCROLL_FRAME_MS: u64 = 16;
 const UNDO_COALESCE: Duration = Duration::from_millis(700);
 const UNDO_LIMIT: usize = 200;
@@ -80,16 +79,18 @@ fn caret_visible(ms_since_activity: u64) -> bool {
     (ms_since_activity / CARET_BLINK_MS) % 2 == 0
 }
 
-// Size the bar to cap height, not the line box. Default leading is phi, so a
-// full-height caret sticks out above and below the glyphs. Cap height is about
-// 0.75em; the em square itself still looks taller than the letters.
-fn caret_rect(origin: Point<Pixels>, line_height: Pixels, font_size: Pixels) -> Bounds<Pixels> {
-    let height = (font_size * CARET_HEIGHT_RATIO).min(line_height);
-    let y_offset = (line_height - height) / 2.;
-    Bounds::new(
-        point(origin.x, origin.y + y_offset),
-        size(CARET_WIDTH, height),
-    )
+// Size the bar to the line box, the way a browser caret is sized.
+//
+// Upstream sizes it to cap height (0.75em) instead, "because default leading is
+// phi, so a full-height caret sticks out above and below the glyphs". That holds
+// when the line box is much taller than the text, which is what upstream's own
+// `window.line_height()` produced before 0.7.0. An input that declares its own
+// `lineHeight` — every field in this product does — has a line box that matches
+// its text, so cap height renders a bar roughly half the height of the glyphs
+// beside it. This fork keeps the line-box rule, and the app declares the line box
+// it wants.
+fn caret_rect(origin: Point<Pixels>, line_height: Pixels, _font_size: Pixels) -> Bounds<Pixels> {
+    Bounds::new(origin, size(CARET_WIDTH, line_height))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2036,10 +2037,11 @@ mod tests {
     }
 
     #[test]
-    fn caret_matches_the_font_size_inside_the_line() {
+    fn caret_spans_the_line_box() {
         let bounds = caret_rect(point(px(10.0), px(4.0)), px(20.0), px(16.0));
-        assert_eq!(bounds.origin, point(px(10.0), px(8.0)));
-        assert_eq!(bounds.size, size(px(2.0), px(12.0)));
+        assert_eq!(bounds.origin, point(px(10.0), px(4.0)));
+        assert_eq!(bounds.size, size(px(2.0), px(20.0)));
+        // A font larger than the line box still stays inside it.
         assert_eq!(
             caret_rect(point(px(0.0), px(0.0)), px(20.0), px(40.0))
                 .size
